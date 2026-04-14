@@ -58,89 +58,158 @@ namespace OpenTap.Python
                     modules.AddRange(mod2);
                 }
                 if(modules.Any())
-                    Py.Import("opentap");
+                {
+                    using var opentapModule = Py.Import("opentap");
+                }
 
                 var sources = new Dictionary<string, PythonTypeDataSource>();
 
                 var visitedTypes2 = new HashSet<PyType>();
-                foreach (var file in modules)
+                try
                 {
-                    var baseModule = Path.GetFileNameWithoutExtension(file);
-                    
-                    try
+                    foreach (var file in modules)
                     {
-                        
-                        var pyFiles = Directory.EnumerateFiles(file, "*.py");
-                        foreach (var py in pyFiles)
+                        var baseModule = Path.GetFileNameWithoutExtension(file);
+
+                        try
                         {
-                            
-                            var subName = Path.GetFileNameWithoutExtension(py);
-                            var moduleName = baseModule;
-                            if (subName != "__init__")
+
+                            var pyFiles = Directory.EnumerateFiles(file, "*.py");
+                            foreach (var py in pyFiles)
                             {
-                                moduleName = baseModule + "." + subName;
-                            }
 
-                            if (moduleName == "Python.opentap")
-                                continue;
-
-                            log.Debug("Loading: {0}", moduleName);
-
-                            PyObject module;
-                            try
-                            {
-                                module = Py.Import(moduleName);
-                            }
-                            catch(Exception e){
-                                log.Error("Caught exception loading {0}: {1}", moduleName, e.Message);
-                                log.Debug(e);
-                                continue;
-                            }
-                            var files = module.GetAttr("__dict__");
-
-                            var objValues = new PyDict(files);
-
-                            var values = objValues.Values().ToArray();
-
-                            for (int i = 0; i < values.Length; i++)
-                            {
-                                var _item = values[i];
-                                var name = _item.GetPythonType().Name;
-
-                                if (name != "CLRMetatype") continue;
-
-                                var pyType = new PyType(_item);
-                                var type = (Type) _item.AsManagedObject(typeof(Type));
-
-                                if (!type.Assembly.IsDynamic)
-                                    continue;
-
-                                if (!pyType.HasAttr("__module__")) continue;
-                                var mod = pyType.GetAttr("__module__").As<string>();
-                                if (!sources.TryGetValue(mod, out var asm))
+                                var subName = Path.GetFileNameWithoutExtension(py);
+                                var moduleName = baseModule;
+                                if (subName != "__init__")
                                 {
-                                    asm = sources[mod] = new PythonTypeDataSource(mod, py);
+                                    moduleName = baseModule + "." + subName;
                                 }
 
-                                var td = TypeData.FromType(type);
-                                if (visitedTypes2.Add(pyType))
-                                    types.Add(td);
-                                asm.DiscoveredTypes[td.Name] = td;
+                                if (moduleName == "Python.opentap")
+                                    continue;
+
+                                log.Debug("Loading: {0}", moduleName);
+
+                                PyObject module;
+                                try
+                                {
+                                    module = Py.Import(moduleName);
+                                }
+                                catch (Exception e)
+                                {
+                                    log.Error("Caught exception loading {0}: {1}", moduleName, e.Message);
+                                    log.Debug(e);
+                                    continue;
+                                }
+
+                                try
+                                {
+                                    using var files = module.GetAttr("__dict__");
+                                    using var objValues = new PyDict(files);
+                                    var values = objValues.Values().ToArray();
+
+                                    try
+                                    {
+                                        for (int i = 0; i < values.Length; i++)
+                                        {
+                                            var _item = values[i];
+                                            using var itemType = _item.GetPythonType();
+                                            var name = itemType.Name;
+
+                                            if (name != "CLRMetatype") continue;
+
+                                            var pyType = new PyType(_item);
+                                            Type type;
+                                            try
+                                            {
+                                                type = (Type)_item.AsManagedObject(typeof(Type));
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                log.Warning("AsManagedObject failed for type in {0}: {1}", moduleName, ex.Message);
+                                                pyType.Dispose();
+                                                continue;
+                                            }
+
+                                            if (!type.Assembly.IsDynamic)
+                                            {
+                                                pyType.Dispose();
+                                                continue;
+                                            }
+
+                                            if (!pyType.HasAttr("__module__"))
+                                            {
+                                                pyType.Dispose();
+                                                continue;
+                                            }
+
+                                            using var modAttr = pyType.GetAttr("__module__");
+                                            var mod = modAttr.As<string>();
+                                            if (!sources.TryGetValue(mod, out var asm))
+                                            {
+                                                asm = sources[mod] = new PythonTypeDataSource(mod, py);
+                                            }
+
+                                            var td = TypeData.FromType(type);
+                                            if (visitedTypes2.Add(pyType))
+                                                types.Add(td);
+                                            else
+                                                pyType.Dispose();
+                                            asm.DiscoveredTypes[td.Name] = td;
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        foreach (var v in values)
+                                            v.Dispose();
+                                    }
+                                }
+                                finally
+                                {
+                                    module.Dispose();
+                                }
                             }
                         }
-                    }
-                    catch (Exception e)
-                    {
-                        log.Error("Caught exception loading {0}: {1}", file, e.Message);
-                        log.Debug(e);
+                        catch (Exception e)
+                        {
+                            log.Error("Caught exception loading {0}: {1}", file, e.Message);
+                            log.Debug(e);
+                        }
                     }
                 }
+                finally
+                {
+                    foreach (var pt in visitedTypes2)
+                        pt.Dispose();
+                }
 
-                PythonPluginProvider.types =
-                    types.ToImmutableDictionary(x => x.Name, x => new PythonTypeDataWrapper(x));
-                PythonPluginProvider.typeDataSources = sources.Values
-                    .SelectMany(x => x.DiscoveredTypes.Select(y => (y.Value, x)))
-                    .ToImmutableDictionary(x => new PythonTypeDataWrapper(x.Value), x => x.x);
+                // Build the types dictionary, skipping duplicate names (can happen when
+                // multiple Python modules import the same base class like PyTestStep).
+                var typesDict = new Dictionary<string, PythonTypeDataWrapper>();
+                foreach (var td in types)
+                {
+                    if (typesDict.ContainsKey(td.Name))
+                    {
+                        log.Debug("Skipping duplicate Python type: {0}", td.Name);
+                        continue;
+                    }
+                    typesDict[td.Name] = new PythonTypeDataWrapper(td);
+                }
+                PythonPluginProvider.types = typesDict.ToImmutableDictionary();
+                
+                var sourcesDict = new Dictionary<PythonTypeDataWrapper, PythonTypeDataSource>();
+                foreach (var src in sources.Values)
+                {
+                    foreach (var kv in src.DiscoveredTypes)
+                    {
+                        var wrapper = new PythonTypeDataWrapper(kv.Value);
+                        if (!sourcesDict.ContainsKey(wrapper))
+                            sourcesDict[wrapper] = src;
+                    }
+                }
+                PythonPluginProvider.typeDataSources = sourcesDict.ToImmutableDictionary();
+                
+                log.Debug("Python type search complete: {0} unique types registered", typesDict.Count);
             }
         }
 

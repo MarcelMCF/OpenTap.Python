@@ -20,8 +20,11 @@ class PythonTypeDataWrapper : ITypeData
     public object CreateInstance(object[] arguments)
     {
         var mem = innerType.CreateInstance(arguments);
-        using(Py.GIL())
-            return mem.ToPython().AsManagedObject(innerType.Type);
+        using (Py.GIL())
+        {
+            using var pyObj = mem.ToPython();
+            return pyObj.AsManagedObject(innerType.Type);
+        }
     }
 
     public ITypeData BaseType => innerType;
