@@ -57,7 +57,7 @@ namespace OpenTap.Python
                         .Where(dir => Directory.EnumerateFiles(dir, "*.py").Any()).ToList();
                     modules.AddRange(mod2);
                 }
-                if(modules.Any())
+                if (modules.Any())
                 {
                     using var opentapModule = Py.Import("opentap");
                 }
@@ -196,7 +196,7 @@ namespace OpenTap.Python
                     typesDict[td.Name] = new PythonTypeDataWrapper(td);
                 }
                 PythonPluginProvider.types = typesDict.ToImmutableDictionary();
-                
+
                 var sourcesDict = new Dictionary<PythonTypeDataWrapper, PythonTypeDataSource>();
                 foreach (var src in sources.Values)
                 {
@@ -208,7 +208,7 @@ namespace OpenTap.Python
                     }
                 }
                 PythonPluginProvider.typeDataSources = sourcesDict.ToImmutableDictionary();
-                
+
                 log.Debug("Python type search complete: {0} unique types registered", typesDict.Count);
             }
         }

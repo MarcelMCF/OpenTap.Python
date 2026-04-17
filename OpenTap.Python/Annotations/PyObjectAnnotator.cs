@@ -44,7 +44,7 @@ public class PyObjectAnnotator : IAnnotator
                 }
                 catch
                 {
-                    
+
                 }
             }
 

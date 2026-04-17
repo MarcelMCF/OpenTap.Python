@@ -20,10 +20,18 @@ class PythonTypeDataWrapper : ITypeData
     public object CreateInstance(object[] arguments)
     {
         var mem = innerType.CreateInstance(arguments);
+        // Previously doing ToPython and AsManagedObject retained a reference
+        // because mem already is the correct instance.
+        // We only do this wrapper to ensure properties are refreshed, 
+        // but it leaks the python refcount due to pythonnet ReflectedObjects behavior.
+        // By skipping the internal conversion back and forth unless explicitly necessary, 
+        // or by explicitly releasing the underlying references, we can prevent this.
+
         using (Py.GIL())
         {
-            using var pyObj = mem.ToPython();
-            return pyObj.AsManagedObject(innerType.Type);
+            // Just returning the unwrapped memory avoids the python object being pinned 
+            // infinitely in EvictCollectable sets.
+            return mem;
         }
     }
 

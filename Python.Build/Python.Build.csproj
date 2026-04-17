@@ -2,8 +2,31 @@
 
     <PropertyGroup>
         <TargetFramework>netstandard2.0</TargetFramework>
-        <CreateOpenTapPackage>False</CreateOpenTapPackage>
+        <CreateOpenTapPackage>True</CreateOpenTapPackage>
     </PropertyGroup>
+
+    <!-- Zip the ProjectTemplate directory into the output folder before TapPackage creation -->
+    <Target Name="ZipProjectTemplate" BeforeTargets="OpenTapPackageCreate" AfterTargets="Build">
+        <ZipDirectory SourceDirectory="$(MSBuildThisFileDirectory)..\OpenTap.Python.ProjectTemplate"
+                      DestinationFile="$(OutputPath)OpenTap.Python.ProjectTemplate.zip"
+                      Overwrite="true" />
+    </Target>
+
+    <!-- Remove test assemblies from output so tap package create does not scan them -->
+    <Target Name="CleanTestAssemblies" BeforeTargets="OpenTapPackageCreate" AfterTargets="ZipProjectTemplate">
+        <ItemGroup>
+            <TestAssembliesToRemove Include="$(OutputPath)OpenTap.Python.UnitTests.*" />
+            <TestAssembliesToRemove Include="$(OutputPath)nunit*" />
+            <TestAssembliesToRemove Include="$(OutputPath)NUnit*" />
+            <TestAssembliesToRemove Include="$(OutputPath)testhost*" />
+            <TestAssembliesToRemove Include="$(OutputPath)testcentric*" />
+            <TestAssembliesToRemove Include="$(OutputPath)Microsoft.Testing*" />
+            <TestAssembliesToRemove Include="$(OutputPath)Microsoft.TestPlatform*" />
+            <TestAssembliesToRemove Include="$(OutputPath)Microsoft.VisualStudio.TestPlatform*" />
+            <TestAssembliesToRemove Include="$(OutputPath)Microsoft.VisualStudio.CodeCoverage*" />
+        </ItemGroup>
+        <Delete Files="@(TestAssembliesToRemove)" />
+    </Target>
 
     <ItemGroup>
         <PackageReference Include="OpenTap" Version="$(OpenTapVersion)">
