@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Package Name="Python" xmlns="http://keysight.com/Schemas/tap" Version="4.0.0-alpha" OS="Windows,Linux,MacOS">
+<Package Name="Python" xmlns="http://keysight.com/Schemas/tap" Version="3.3.0-alpha" OS="Windows,Linux,MacOS">
     <Description>
         OpenTAP Python plugin. This plugin includes all tools, and documentation to develop OpenTAP plugins using Python.
         <Links>

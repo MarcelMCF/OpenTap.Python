@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TestPlan type="OpenTap.TestPlan">
+  <Steps>
+    <TestStep type="ot_python_package.DelayStep.DelayStep" Id="a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6">
+      <DelaySecs>0.1</DelaySecs>
+    </TestStep>
+    <TestStep type="ot_python_package.DelayStep.DelayStep" Id="a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e7">
+      <DelaySecs>0.1</DelaySecs>
+    </TestStep>
+    <TestStep type="ot_python_package.DelayStep.DelayStep" Id="a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e8">
+      <DelaySecs>0.1</DelaySecs>
+    </TestStep>
+  </Steps>
+</TestPlan>

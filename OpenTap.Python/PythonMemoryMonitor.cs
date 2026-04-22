@@ -6,14 +6,30 @@ using Python.Runtime;
 namespace OpenTap.Python
 {
     /// <summary>
-    /// Periodically evicts CLR reflected objects and reclaims memory during
-    /// long-running (potentially infinite-loop) test plan executions.
+    /// Periodically reclaims managed and native memory during long-running
+    /// (potentially infinite-loop) test plan executions.
     /// <para>
-    /// <b>Root cause:</b> <c>ITestPlanRunMonitor.ExitTestPlanRun</c> never fires
-    /// for infinite-loop plans ("Main Loop" patterns), so cleanup that only ran at
-    /// plan completion would never execute. This monitor uses a dedicated background
-    /// thread (NOT a <c>System.Threading.Timer</c>) to run the full 6-phase cleanup
-    /// every <see cref="CleanupIntervalSeconds"/> seconds <i>during</i> execution.
+    /// <b>Why this is needed:</b> pythonnet defers <c>Py_DecRef</c> calls from
+    /// .NET finalizer threads into a queue (<c>Finalizer.Instance</c>) because they
+    /// don't hold the Python GIL.  The queue is normally drained opportunistically
+    /// every 200 <c>PyObject</c> constructions (<c>ThrottledCollect</c>), but in
+    /// long-running plans — especially infinite-loop patterns where
+    /// <c>ExitTestPlanRun</c> never fires — the queue can grow faster than it is
+    /// drained, and native memory freed by Python's allocator is not returned to
+    /// the OS (malloc fragmentation on Linux).
+    /// </para>
+    /// <para>
+    /// <b>reflectedObjects cleanup:</b> The reflected-objects tracking set is now
+    /// maintained at the source in pythonnet:
+    /// <c>ClassBase.tp_clear</c> removes entries for regular CLR wrappers when
+    /// they are deallocated, and <c>ClassDerivedObject.tp_dealloc</c> /
+    /// <c>ToPython</c> manage entries for Python-derived types across their
+    /// dealloc/resurrection lifecycle.  No external eviction sweep is needed.
+    /// </para>
+    /// <para>
+    /// This monitor uses a dedicated background thread (NOT a
+    /// <c>System.Threading.Timer</c>) to run a 5-phase cleanup cycle every
+    /// <see cref="CleanupIntervalSeconds"/> seconds <i>during</i> execution.
     /// </para>
     /// <para>
     /// <b>Why a dedicated thread?</b> The cleanup acquires the Python GIL, which can
@@ -26,7 +42,7 @@ namespace OpenTap.Python
     /// </summary>
     [Display("Python Memory Monitor",
         Group: "Python",
-        Description: "Periodically evicts leaked CLR reflected objects and " +
+        Description: "Periodically drains the pythonnet finalizer queue and " +
                      "reclaims memory during test plan execution, preventing " +
                      "memory growth in long-running sessions.")]
     public class PythonMemoryMonitor : ComponentSettings<PythonMemoryMonitor>,
@@ -69,16 +85,12 @@ namespace OpenTap.Python
             int maxWorker = Math.Max(Environment.ProcessorCount * 16, 64);
             int maxIO = Math.Max(Environment.ProcessorCount * 16, 64);
             ThreadPool.SetMaxThreads(maxWorker, maxIO);
-            ThreadPool.GetMinThreads(out int minW, out int minIO);
-            ThreadPool.GetAvailableThreads(out int curAvailW, out int curAvailIO);
-            int curBusyW = maxWorker - curAvailW;
-            Log.Info($"[ENTER] ThreadPool capped: max={maxWorker}/{maxIO}, " +
-                     $"min={minW}/{minIO}, busy={curBusyW}");
 
             try
             {
                 Log.Info($"[ENTER] Heap: {_heapAtPlanStart / (1024.0 * 1024.0):F1} MB  " +
                          $"| Cleanup every {CleanupIntervalSeconds}s " +
+                         $"| Reflected objects: {Runtime.ReflectedObjectCount} " +
                          $"| Process threads: {Process.GetCurrentProcess().Threads.Count}");
             }
             catch (Exception ex)
@@ -87,8 +99,6 @@ namespace OpenTap.Python
             }
 
             // Start dedicated cleanup thread instead of System.Threading.Timer.
-            // Timer callbacks run on ThreadPool — blocking on GIL causes the pool to
-            // inject new threads that are never retired, leaking ~3-4 threads/iteration.
             _stopSignal.Reset();
             var intervalSec = Math.Max(CleanupIntervalSeconds, 5);
             _cleanupThread = new Thread(() => CleanupLoop(intervalSec))
@@ -103,7 +113,6 @@ namespace OpenTap.Python
         /// <summary>Stops the cleanup thread and runs one final cleanup.</summary>
         public void ExitTestPlanRun(TestPlanRun planRun)
         {
-            // Signal the cleanup thread to stop and wait up to 60 s for it to exit.
             _stopSignal.Set();
             if (_cleanupThread != null)
             {
@@ -113,7 +122,6 @@ namespace OpenTap.Python
 
             if (!PythonEngine.IsInitialized) return;
 
-            // One final cleanup pass.
             RunCleanupCycle("EXIT-FINAL");
 
             Log.Info($"[EXIT] Peak process threads during plan: {_peakThreadCount}");
@@ -123,9 +131,8 @@ namespace OpenTap.Python
         /// <see cref="_stopSignal"/> is set. Never touches the ThreadPool.</summary>
         private void CleanupLoop(int intervalSec)
         {
-            // Wait one full interval before first tick.
             if (_stopSignal.Wait(TimeSpan.FromSeconds(intervalSec)))
-                return; // Stop signalled during initial wait.
+                return;
 
             while (true)
             {
@@ -134,49 +141,48 @@ namespace OpenTap.Python
                 _cleanupCount++;
                 RunCleanupCycle($"PERIODIC-{_cleanupCount}");
 
-                // Wait for next interval (or early termination).
                 if (_stopSignal.Wait(TimeSpan.FromSeconds(intervalSec)))
                     break;
             }
         }
 
         /// <summary>
-        /// Six-phase cleanup targeting both managed and native memory.
+        /// Four-phase cleanup targeting both managed and native memory.
         /// <list type="number">
-        ///   <item>Evict CLR reflected objects (free GCHandles, Py_DecRef phantom refs; __pyobj__ left intact)</item>
-        ///   <item>Drain pythonnet Finalizer queue</item>
+        ///   <item>Drain pythonnet Finalizer queue (deferred Py_DecRef from .NET finalizers)</item>
         ///   <item>Python gc.collect() × 3 generations + clear type cache</item>
-        ///   <item>.NET GC.Collect (safe: evicted PythonDerived objects retain Strong GCHandles)</item>
-        ///   <item>Drain Finalizer queue again (picks up .NET GC'd items)</item>
+        ///   <item>.NET GC.Collect (accelerates finalizer triggering)</item>
+        ///   <item>Drain Finalizer queue again (picks up Phase 3 finalizers)</item>
         ///   <item>malloc_trim on Linux (return freed native memory to OS)</item>
         /// </list>
+        /// <para>
+        /// <b>Note:</b> Previous versions included an EvictAbandonedObjects phase
+        /// to work around a phantom-reference leak in <c>InvokeCtor</c>. That root
+        /// cause has been fixed — <c>InvokeCtor</c> now properly releases the
+        /// <c>NewReference</c> after <c>__init__</c>, so <c>tp_dealloc</c> fires
+        /// naturally and the dealloc/resurrection lifecycle manages wrapper lifetimes.
+        /// </para>
         /// </summary>
         private void RunCleanupCycle(string tag)
         {
             try
             {
                 var heapBefore = GC.GetTotalMemory(forceFullCollection: false);
-                EvictResult result;
+                int reflectedBefore;
                 int pyGcCollected = 0;
 
-                // ── Phases 1-3: inside GIL ──────────────────────────────
-                // Acquiring the GIL blocks until any running Python step releases it.
-                // This is safe — the step finishes its current Python C API call, we
-                // run cleanup, then the step (or next step) re-acquires the GIL.
+                // ── Phases 1-2: inside GIL ──────────────────────────────
                 using (Py.GIL())
                 {
-                    // Phase 1: Aggressive eviction — release phantom references for
-                    // non-baseline objects via Py_DecRef (rc>1), free GCHandles for rc≤1.
-                    // PythonDerived objects keep their __pyobj__ intact so they remain
-                    // usable if the test plan is reused across multiple runs.
-                    result = Runtime.EvictReflectedObjects(maxRefcount: long.MaxValue);
+                    reflectedBefore = Runtime.ReflectedObjectCount;
 
-                    // Phase 2: Drain the Finalizer queue — objects finalized by .NET GC
-                    // have deferred Py_DecRef calls queued. Process them now.
+                    // Phase 1: Drain the Finalizer queue — objects finalized by .NET GC
+                    // have deferred Py_DecRef calls queued.  Processing them now allows
+                    // Python wrappers to reach rc=0 → tp_dealloc → reflectedObjects cleanup.
                     try { Finalizer.Instance.Collect(); }
                     catch (Exception ex) { Log.Debug($"[{tag}] Finalizer drain 1: {ex.Message}"); }
 
-                    // Phase 3: Full Python GC sweep (all 3 generations) + clear type cache.
+                    // Phase 2: Full Python GC sweep (all 3 generations) + clear type cache.
                     try
                     {
                         using var gc = PyModule.Import("gc");
@@ -195,25 +201,21 @@ namespace OpenTap.Python
                     catch (Exception ex) { Log.Debug($"[{tag}] Python gc.collect: {ex.Message}"); }
                 }
 
-                // ── Phase 4: .NET GC (outside GIL) ─────────────────────
-                // Safe because evicted PythonDerived objects with rc>1 still have
-                // Strong GCHandles (tp_dealloc doesn't fire when rc stays ≥ 1),
-                // so they won't be collected. Objects with rc≤1 had their GCHandle
-                // freed in Pass 2a and can be collected — their finalizers handle
-                // deferred cleanup via the Finalizer queue (Phase 5).
+                // ── Phase 3: .NET GC (outside GIL) ─────────────────────
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
                 GC.WaitForPendingFinalizers();
 
-                // ── Phases 5-6: re-acquire GIL ──────────────────────────
+                // ── Phases 4-5: re-acquire GIL ──────────────────────────
+                int reflectedAfter;
                 using (Py.GIL())
                 {
-                    // Phase 5: Drain Finalizer queue again — .NET GC may have finalized
-                    // more PyObject wrappers whose Py_DecRef was deferred.
+                    // Phase 4: Drain Finalizer queue again.
                     try { Finalizer.Instance.Collect(); }
                     catch (Exception ex) { Log.Debug($"[{tag}] Finalizer drain 2: {ex.Message}"); }
 
-                    // Phase 6: Return freed native memory to the OS (Linux only).
-                    // malloc_trim(0) forces glibc to release arena pages back to the OS.
+                    reflectedAfter = Runtime.ReflectedObjectCount;
+
+                    // Phase 5: Return freed native memory to the OS (Linux only).
                     try
                     {
                         using var ctypes = PyModule.Import("ctypes");
@@ -234,28 +236,18 @@ namespace OpenTap.Python
                 var deltaMb = (heapAfter - heapBefore) / (1024.0 * 1024.0);
                 var totalDeltaMb = (heapAfter - _heapAtPlanStart) / (1024.0 * 1024.0);
 
-                // ── Thread diagnostics ──────────────────────────────────
-                ThreadPool.GetAvailableThreads(out int availW, out int availIO);
-                ThreadPool.GetMaxThreads(out int maxW, out int maxIO);
-                int busyW = maxW - availW;
-                int busyIO = maxIO - availIO;
                 int processThreads = 0;
                 try { processThreads = Process.GetCurrentProcess().Threads.Count; }
                 catch { /* may fail on some platforms */ }
                 if (processThreads > _peakThreadCount)
                     _peakThreadCount = processThreads;
 
-                Log.Info($"[{tag}] Evicted {result.TotalEvicted}/{result.TotalBefore}: " +
-                         $"rc1={result.EvictedRc1}, alive={result.EvictedAlive}, " +
-                         $"zombies={result.EvictedZombies}, invalid={result.EvictedInvalid}, " +
-                         $"remaining={result.Alive}. " +
-                         $"PyGC: {pyGcCollected}. " +
-                         $"Reflected: {result.TotalBefore} → {result.TotalAfter}. " +
+                Log.Info($"[{tag}] PyGC: {pyGcCollected}. " +
+                         $"Reflected: {reflectedBefore} → {reflectedAfter}. " +
                          $"Heap: {heapAfter / (1024.0 * 1024.0):F1} MB " +
                          $"(cycle: {deltaMb:+0.0;-0.0;0.0} MB, " +
                          $"total: {totalDeltaMb:+0.0;-0.0;0.0} MB) " +
                          $"| Threads: process={processThreads}, " +
-                         $"pool(busy={busyW}w/{busyIO}io, max={maxW}), " +
                          $"peak={_peakThreadCount}");
             }
             catch (Exception ex)
