@@ -23,6 +23,71 @@ class PythonTypeDataWrapper : ITypeData
     /// </summary>
     static readonly ConditionalWeakTable<object, PyObject> _aliveObjects = new();
 
+    /// <summary>
+    /// Parallel weak-reference list of keys currently in <see cref="_aliveObjects"/>.
+    /// Required because <see cref="ConditionalWeakTable{TKey,TValue}"/> on
+    /// netstandard2.0 does not expose enumeration.  Used by
+    /// <see cref="RemoveAnchors"/> to walk the live keys.  Dead entries are
+    /// pruned opportunistically during enumeration.
+    /// </summary>
+    static readonly List<WeakReference<object>> _trackedKeys = new();
+    static readonly object _trackedKeysLock = new();
+
+    /// <summary>
+    /// Drops the anchoring <see cref="PyObject"/> for any entries in
+    /// <see cref="_aliveObjects"/> whose .NET object satisfies
+    /// <paramref name="predicate"/>.
+    /// <para>
+    /// This is required to let
+    /// <see cref="Runtime.EvictAbandonedObjects(Func{object,bool})"/>
+    /// actually free the Python wrapper:  the anchor here adds an INCREF, so
+    /// the wrapper's <c>tp_dealloc</c> never fires while the entry is in
+    /// place.  Removing the entry and disposing the <see cref="PyObject"/>
+    /// drops that INCREF, breaking the
+    /// <c>step → CWT entry → PyObject → Python wrapper → GCHandle → step</c>
+    /// reference cycle.
+    /// </para>
+    /// <para><b>Must be called with the Python GIL held.</b></para>
+    /// </summary>
+    /// <param name="predicate">Returns <c>true</c> for objects whose anchor
+    /// should be released.  Typical usage: <c>inst is ITestStep s &amp;&amp;
+    /// s.Parent == null</c>.</param>
+    /// <returns>The number of anchors released.</returns>
+    public static int RemoveAnchors(Func<object, bool> predicate)
+    {
+        if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+
+        int released = 0;
+        lock (_trackedKeysLock)
+        {
+            for (int i = _trackedKeys.Count - 1; i >= 0; i--)
+            {
+                if (!_trackedKeys[i].TryGetTarget(out var key))
+                {
+                    // Key was collected — prune the dead weak-ref.
+                    _trackedKeys.RemoveAt(i);
+                    continue;
+                }
+
+                bool matches;
+                try { matches = predicate(key); }
+                catch { matches = false; }
+
+                if (!matches) continue;
+
+                if (_aliveObjects.TryGetValue(key, out var py))
+                {
+                    _aliveObjects.Remove(key);
+                    try { py.Dispose(); } // releases the INCREF on the Python wrapper
+                    catch { /* best-effort */ }
+                }
+                _trackedKeys.RemoveAt(i);
+                released++;
+            }
+        }
+        return released;
+    }
+
     readonly TypeData innerType;
     public PythonTypeDataWrapper(TypeData innerType) => this.innerType = innerType;
     public IEnumerable<object> Attributes => innerType.Attributes;
@@ -50,6 +115,14 @@ class PythonTypeDataWrapper : ITypeData
                 // object is still alive.
                 _aliveObjects.Remove(result);
                 _aliveObjects.Add(result, py);
+
+                // Track the key in a parallel weak-ref list so RemoveAnchors
+                // can enumerate live keys (CWT itself is not enumerable on
+                // netstandard2.0).
+                lock (_trackedKeysLock)
+                {
+                    _trackedKeys.Add(new WeakReference<object>(result));
+                }
 
                 return result;
             }

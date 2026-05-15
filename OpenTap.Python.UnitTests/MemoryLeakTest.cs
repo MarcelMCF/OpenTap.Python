@@ -114,7 +114,32 @@ namespace OpenTap.Python.UnitTests
             Log.Info("--- Test 10: Combined stress test (20 rounds) ---");
             TestCombinedStress(stepType, rounds: 20);
 
-            Log.Info("=== All 10 memory tests passed ===");
+            // ── 11. XML load + execute + discard (same plan) ───────────
+            Log.Info("--- Test 11: XML load+execute+discard, same plan (100 cycles) ---");
+            TestXmlLoadExecuteDiscardSamePlan(stepType, cycles: 100);
+
+            // ── 12. XML load + execute + SWITCH between two plans ──────
+            // This is the production scenario: long-lived runner session
+            // alternates between distinct test plans (LoadTestPlanStep
+            // feeds Session 2 with different XML each time).
+            Log.Info("--- Test 12: XML load+switch+execute, two plans (100 switches) ---");
+            TestXmlLoadSwitchExecute(stepType, switches: 100);
+
+            // ── 12b. Heavy production-style: 50-step plans, switch 50× ──
+            // Mimics realistic production plan size — exposes per-step
+            // accumulation that single-step tests miss.
+            Log.Info("--- Test 12b: heavy 50-step plans (50 switches) ---");
+            TestXmlLoadSwitchExecuteHeavy(stepType, switches: 50, stepsPerPlan: 50);
+
+            // ── 13. WeakReference leak detector ────────────────────────
+            // For each thing that "should" be collectable after a plan
+            // execution finishes (TestPlan, ITestStep, TestPlanRun), assert
+            // it actually IS collectable.  Anything still alive after
+            // forced GC means a strong reference is leaking it.
+            Log.Info("--- Test 13: WeakReference leak detector ---");
+            TestWeakReferenceLeakDetector(stepType);
+
+            Log.Info("=== All 13 memory tests passed ===");
             return 0;
         }
 
@@ -404,6 +429,15 @@ namespace OpenTap.Python.UnitTests
                     // orphaned steps (ITestStep with no parent).
                     try
                     {
+                        // Drop strong PyObject anchors first so eviction can
+                        // actually free the wrapper.
+                        PythonTypeDataWrapper.RemoveAnchors(inst =>
+                        {
+                            if (inst is OpenTap.ITestStep step)
+                                return step.Parent == null;
+                            return false;
+                        });
+
                         evicted = Runtime.EvictAbandonedObjects(inst =>
                         {
                             if (inst is OpenTap.ITestStep step)
@@ -823,11 +857,454 @@ namespace OpenTap.Python.UnitTests
         }
 
         // ═══════════════════════════════════════════════════════════════
-        //  Helpers
+        //  Test 11 – XML load + execute + discard (same plan)
         // ═══════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Runs a full cleanup cycle matching what PythonMemoryMonitor does:
+        /// Mirrors the production OpenTAP runner Session 2 lifecycle for the
+        /// "same testplan executed continuously" case: XML is deserialised into
+        /// a fresh <see cref="TestPlan"/> instance, the plan is executed, then
+        /// the reference is dropped.  Repeating this many times must not grow
+        /// reflectedObjects or RSS continuously — TapSerializer caches and
+        /// dynamic type wrappers are expected to recycle.
+        /// </summary>
+        private void TestXmlLoadExecuteDiscardSamePlan(ITypeData stepType, int cycles)
+        {
+            var xml = BuildPlanXml(stepType);
+
+            // Warmup
+            for (int i = 0; i < 5; i++)
+            {
+                var p = LoadPlanFromXml(xml);
+                p.Execute();
+                p.ChildTestSteps.Clear();
+            }
+            RunFullCleanupCycle();
+
+            int baseReflected = Runtime.ReflectedObjectCount;
+            long baseRss = GetRssBytes();
+            long baseHeap = GC.GetTotalMemory(true);
+            Log.Info($"  Base: reflected={baseReflected}, RSS={baseRss / (1024.0 * 1024):F1} MB, heap={baseHeap / (1024.0 * 1024):F1} MB");
+
+            for (int i = 0; i < cycles; i++)
+            {
+                var plan = LoadPlanFromXml(xml);
+                plan.Execute();
+                plan.ChildTestSteps.Clear();
+
+                if ((i + 1) % 10 == 0)
+                {
+                    RunFullCleanupCycle();
+                    int reflected = Runtime.ReflectedObjectCount;
+                    long rss = GetRssBytes();
+                    long heap = GC.GetTotalMemory(false);
+                    Log.Info($"  Cycle {i + 1}/{cycles}: reflected={reflected} " +
+                             $"(delta={reflected - baseReflected:+0;-0;0}), " +
+                             $"RSS={rss / (1024.0 * 1024):F1} MB " +
+                             $"(delta={((rss - baseRss) / (1024.0 * 1024)):+0.0;-0.0;0.0} MB), " +
+                             $"heap={heap / (1024.0 * 1024):F1} MB " +
+                             $"(delta={((heap - baseHeap) / (1024.0 * 1024)):+0.0;-0.0;0.0} MB)");
+                }
+            }
+
+            RunFullCleanupCycle();
+            RunFullCleanupCycle();
+
+            int finalReflected = Runtime.ReflectedObjectCount;
+            long finalRss = GetRssBytes();
+            long finalHeap = GC.GetTotalMemory(true);
+            int reflectedGrowth = finalReflected - baseReflected;
+            long rssGrowth = finalRss - baseRss;
+            long heapGrowth = finalHeap - baseHeap;
+
+            Log.Info($"  Final: reflected={finalReflected} (growth={reflectedGrowth:+0;-0;0}), " +
+                     $"RSS delta={rssGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB, " +
+                     $"heap delta={heapGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB");
+
+            // Strict thresholds: per-cycle the plan is fully torn down, so growth
+            // should be tiny.  Allow some slack for one-time TapSerializer warmup
+            // that might happen after the warmup loop.
+            const int maxReflectedGrowth = 50;
+            const long maxRssGrowthBytes = 30L * 1024 * 1024;
+
+            if (reflectedGrowth > maxReflectedGrowth)
+                throw new Exception(
+                    $"XML load same-plan FAILED: reflected grew by {reflectedGrowth} " +
+                    $"over {cycles} cycles (max {maxReflectedGrowth})");
+
+            if (rssGrowth > maxRssGrowthBytes)
+                throw new Exception(
+                    $"XML load same-plan FAILED: RSS grew by {rssGrowth / (1024.0 * 1024):F1} MB " +
+                    $"over {cycles} cycles (max {maxRssGrowthBytes / (1024 * 1024)} MB)");
+
+            Log.Info($"  XML load same-plan ({cycles} cycles): " +
+                     $"reflected growth={reflectedGrowth}, RSS growth={rssGrowth / (1024.0 * 1024):F1} MB — OK");
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Test 12 – XML load + switch between two plans + execute
+        // ═══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Mirrors the production scenario where the runner session loads
+        /// alternating test plans (e.g. <c>plan A</c>, <c>plan B</c>, <c>plan A</c>, …)
+        /// from XML, executes each once, and discards.
+        ///
+        /// Two distinct XMLs are used to defeat any per-XML deserialisation
+        /// cache that might mask a leak by reusing the same parsed objects.
+        /// We assert RSS, heap, and reflectedObjects all stay bounded.
+        /// </summary>
+        private void TestXmlLoadSwitchExecute(ITypeData stepType, int switches)
+        {
+            // Two structurally different plans so TapSerializer cannot
+            // shortcut by hashing the input.
+            var xmlA = BuildPlanXml(stepType, stepCount: 1, planName: "PlanA");
+            var xmlB = BuildPlanXml(stepType, stepCount: 2, planName: "PlanB");
+
+            // Warmup — alternate a few times to JIT both code paths
+            for (int i = 0; i < 6; i++)
+            {
+                var p = LoadPlanFromXml(i % 2 == 0 ? xmlA : xmlB);
+                p.Execute();
+                p.ChildTestSteps.Clear();
+            }
+            RunFullCleanupCycle();
+
+            int baseReflected = Runtime.ReflectedObjectCount;
+            long baseRss = GetRssBytes();
+            long baseHeap = GC.GetTotalMemory(true);
+            Log.Info($"  Base: reflected={baseReflected}, RSS={baseRss / (1024.0 * 1024):F1} MB, heap={baseHeap / (1024.0 * 1024):F1} MB");
+
+            // Sample RSS history to detect monotonic growth
+            long[] rssSamples = new long[switches / 10];
+            int sampleIx = 0;
+
+            for (int i = 0; i < switches; i++)
+            {
+                var xml = i % 2 == 0 ? xmlA : xmlB;
+                var plan = LoadPlanFromXml(xml);
+                plan.Execute();
+                plan.ChildTestSteps.Clear();
+
+                if ((i + 1) % 10 == 0)
+                {
+                    RunFullCleanupCycle();
+                    int reflected = Runtime.ReflectedObjectCount;
+                    long rss = GetRssBytes();
+                    long heap = GC.GetTotalMemory(false);
+                    if (sampleIx < rssSamples.Length) rssSamples[sampleIx++] = rss;
+                    Log.Info($"  Switch {i + 1}/{switches} ({(i % 2 == 0 ? "A" : "B")}): " +
+                             $"reflected={reflected} (delta={reflected - baseReflected:+0;-0;0}), " +
+                             $"RSS={rss / (1024.0 * 1024):F1} MB " +
+                             $"(delta={((rss - baseRss) / (1024.0 * 1024)):+0.0;-0.0;0.0} MB), " +
+                             $"heap={heap / (1024.0 * 1024):F1} MB");
+                }
+            }
+
+            RunFullCleanupCycle();
+            RunFullCleanupCycle();
+
+            int finalReflected = Runtime.ReflectedObjectCount;
+            long finalRss = GetRssBytes();
+            long finalHeap = GC.GetTotalMemory(true);
+            int reflectedGrowth = finalReflected - baseReflected;
+            long rssGrowth = finalRss - baseRss;
+            long heapGrowth = finalHeap - baseHeap;
+
+            // Linear-regression-lite: compare avg of first 3 samples to last 3.
+            // If the trend is monotonic upward, that's the leak signal.
+            long firstAvg = 0, lastAvg = 0;
+            if (sampleIx >= 6)
+            {
+                long first = 0, last = 0;
+                for (int k = 0; k < 3; k++) { first += rssSamples[k]; last += rssSamples[sampleIx - 1 - k]; }
+                firstAvg = first / 3;
+                lastAvg = last / 3;
+            }
+
+            Log.Info($"  Final: reflected={finalReflected} (growth={reflectedGrowth:+0;-0;0}), " +
+                     $"RSS delta={rssGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB, " +
+                     $"heap delta={heapGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB");
+            if (sampleIx >= 6)
+                Log.Info($"  RSS trend: first 3 samples avg={firstAvg / (1024.0 * 1024):F1} MB, " +
+                         $"last 3 avg={lastAvg / (1024.0 * 1024):F1} MB, " +
+                         $"trend={(lastAvg - firstAvg) / (1024.0 * 1024):+0.0;-0.0;0.0} MB");
+
+            const int maxReflectedGrowth = 80;          // 2 step types × tolerance
+            const long maxRssGrowthBytes = 40L * 1024 * 1024;
+            const long maxRssTrendBytes = 25L * 1024 * 1024; // last 3 vs first 3
+
+            if (reflectedGrowth > maxReflectedGrowth)
+                throw new Exception(
+                    $"XML load+switch FAILED: reflected grew by {reflectedGrowth} " +
+                    $"over {switches} switches (max {maxReflectedGrowth})");
+
+            if (rssGrowth > maxRssGrowthBytes)
+                throw new Exception(
+                    $"XML load+switch FAILED: RSS grew by {rssGrowth / (1024.0 * 1024):F1} MB " +
+                    $"over {switches} switches (max {maxRssGrowthBytes / (1024 * 1024)} MB)");
+
+            if (sampleIx >= 6 && (lastAvg - firstAvg) > maxRssTrendBytes)
+                throw new Exception(
+                    $"XML load+switch FAILED: RSS trend +{(lastAvg - firstAvg) / (1024.0 * 1024):F1} MB " +
+                    $"(max {maxRssTrendBytes / (1024 * 1024)} MB) suggests monotonic leak");
+
+            Log.Info($"  XML load+switch ({switches} switches): " +
+                     $"reflected growth={reflectedGrowth}, RSS growth={rssGrowth / (1024.0 * 1024):F1} MB — OK");
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Test 12b — Heavy production-style load+switch
+        // ═══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Bigger version of <see cref="TestXmlLoadSwitchExecute"/> using
+        /// <paramref name="stepsPerPlan"/> Python steps per plan to mimic
+        /// realistic production plans (~50 steps).  Logs a per-type
+        /// histogram of <c>reflectedObjects</c> on every cycle so we can
+        /// see what types accumulate.
+        /// </summary>
+        private void TestXmlLoadSwitchExecuteHeavy(ITypeData stepType, int switches, int stepsPerPlan)
+        {
+            var xmlA = BuildPlanXml(stepType, stepCount: stepsPerPlan, planName: "HeavyA");
+            var xmlB = BuildPlanXml(stepType, stepCount: stepsPerPlan + 1, planName: "HeavyB");
+
+            // Warmup
+            for (int i = 0; i < 3; i++)
+            {
+                var p = LoadPlanFromXml(i % 2 == 0 ? xmlA : xmlB);
+                p.Execute();
+                p.ChildTestSteps.Clear();
+            }
+            RunFullCleanupCycle();
+            RunFullCleanupCycle();
+
+            int baseReflected = Runtime.ReflectedObjectCount;
+            long baseRss = GetRssBytes();
+            long baseHeap = GC.GetTotalMemory(true);
+            Log.Info($"  Base: reflected={baseReflected}, RSS={baseRss / (1024.0 * 1024):F1} MB, heap={baseHeap / (1024.0 * 1024):F1} MB");
+            DumpHistogram("BASE");
+
+            for (int i = 0; i < switches; i++)
+            {
+                var xml = i % 2 == 0 ? xmlA : xmlB;
+                var plan = LoadPlanFromXml(xml);
+                plan.Execute();
+                plan.ChildTestSteps.Clear();
+
+                if ((i + 1) % 5 == 0)
+                {
+                    RunFullCleanupCycle();
+                    int reflected = Runtime.ReflectedObjectCount;
+                    long rss = GetRssBytes();
+                    long heap = GC.GetTotalMemory(false);
+                    Log.Info($"  Heavy switch {i + 1}/{switches} ({(i % 2 == 0 ? "A" : "B")}): " +
+                             $"reflected={reflected} (delta={reflected - baseReflected:+0;-0;0}), " +
+                             $"RSS={rss / (1024.0 * 1024):F1} MB " +
+                             $"(delta={((rss - baseRss) / (1024.0 * 1024)):+0.0;-0.0;0.0} MB), " +
+                             $"heap={heap / (1024.0 * 1024):F1} MB " +
+                             $"(delta={((heap - baseHeap) / (1024.0 * 1024)):+0.0;-0.0;0.0} MB)");
+                }
+            }
+
+            RunFullCleanupCycle();
+            RunFullCleanupCycle();
+
+            int finalReflected = Runtime.ReflectedObjectCount;
+            long finalRss = GetRssBytes();
+            long finalHeap = GC.GetTotalMemory(true);
+            int reflectedGrowth = finalReflected - baseReflected;
+            long rssGrowth = finalRss - baseRss;
+            long heapGrowth = finalHeap - baseHeap;
+
+            Log.Info($"  Final: reflected={finalReflected} (growth={reflectedGrowth:+0;-0;0}), " +
+                     $"RSS delta={rssGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB, " +
+                     $"heap delta={heapGrowth / (1024.0 * 1024):+0.0;-0.0;0.0} MB");
+            DumpHistogram("FINAL");
+
+            // Per-switch attribution to make leak ratios obvious in logs.
+            double perSwitchReflected = reflectedGrowth / (double)switches;
+            double perSwitchHeapKb = (heapGrowth / 1024.0) / switches;
+            Log.Info($"  Per-switch: reflected={perSwitchReflected:F2}, heap={perSwitchHeapKb:F1} KB");
+
+            // Strict thresholds — any per-switch growth over a tiny budget
+            // means we're still leaking.
+            const int maxReflectedGrowth = 50;
+            const long maxHeapGrowthBytes = 8L * 1024 * 1024; // 8 MB over 50 heavy cycles
+            const long maxRssGrowthBytes = 30L * 1024 * 1024;
+
+            if (reflectedGrowth > maxReflectedGrowth)
+                throw new Exception(
+                    $"Heavy load+switch FAILED: reflected grew by {reflectedGrowth} " +
+                    $"over {switches} cycles of {stepsPerPlan}-step plans (max {maxReflectedGrowth})");
+
+            if (heapGrowth > maxHeapGrowthBytes)
+                throw new Exception(
+                    $"Heavy load+switch FAILED: heap grew by {heapGrowth / (1024.0 * 1024):F1} MB " +
+                    $"over {switches} cycles (max {maxHeapGrowthBytes / (1024 * 1024)} MB)");
+
+            if (rssGrowth > maxRssGrowthBytes)
+                throw new Exception(
+                    $"Heavy load+switch FAILED: RSS grew by {rssGrowth / (1024.0 * 1024):F1} MB " +
+                    $"over {switches} cycles (max {maxRssGrowthBytes / (1024 * 1024)} MB)");
+
+            Log.Info($"  Heavy load+switch ({switches} × {stepsPerPlan}-step plans): " +
+                     $"reflected growth={reflectedGrowth}, heap growth={heapGrowth / (1024.0 * 1024):F1} MB — OK");
+        }
+
+        /// <summary>Logs a histogram of the top reflected-object types under a tag.</summary>
+        private static void DumpHistogram(string tag)
+        {
+            try
+            {
+                IReadOnlyList<(string TypeName, int Count, long TotalRc, int PythonDerivedCount, int ParentlessStepCount)> hist;
+                using (Py.GIL())
+                {
+                    hist = Runtime.DiagnoseTypeHistogram(topN: 15);
+                }
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"  [{tag}] Top reflected types:");
+                foreach (var row in hist)
+                {
+                    sb.Append($"\n     {row.Count,5}× {row.TypeName} (rcSum={row.TotalRc}, pyDerived={row.PythonDerivedCount}, parentless={row.ParentlessStepCount})");
+                }
+                Log.Info(sb.ToString());
+            }
+            catch (Exception ex) { Log.Warning($"  [{tag}] Histogram failed: {ex.Message}"); }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Test 13 – WeakReference leak detector
+        // ═══════════════════════════════════════════════════════════════
+
+        /// <summary>A trivial pure-.NET test step used to bisect the leak.</summary>
+        public sealed class PureDotNetNoOpStep : TestStep
+        {
+            public override void Run() => UpgradeVerdict(Verdict.Pass);
+        }
+
+        /// <summary>
+        /// Builds N plans, executes each, drops every strong reference, then
+        /// asserts via <see cref="WeakReference"/> that the .NET GC actually
+        /// reclaimed each <see cref="TestPlan"/>, each contained
+        /// <see cref="ITestStep"/>, and each <see cref="TestPlanRun"/>.
+        ///
+        /// Bisects across THREE configurations to localise the leak source:
+        ///   A) Pure .NET step + plan + execute  (no Python at all)
+        ///   B) Python step + plan, NO execute   (rules out execution path)
+        ///   C) Python step + plan + execute     (full production path)
+        /// </summary>
+        private void TestWeakReferenceLeakDetector(ITypeData pythonStepType)
+        {
+            var pureStepType = TypeData.FromType(typeof(PureDotNetNoOpStep));
+
+            Log.Info("  -- 13a: pure .NET step, with execute --");
+            int aSurvivors = RunWeakRefScenario(pureStepType, sampleSize: 20, execute: true);
+
+            Log.Info("  -- 13b: Python step, NO execute --");
+            int bSurvivors = RunWeakRefScenario(pythonStepType, sampleSize: 20, execute: false);
+
+            Log.Info("  -- 13c: Python step, with execute --");
+            int cSurvivors = RunWeakRefScenario(pythonStepType, sampleSize: 20, execute: true);
+
+            Log.Info($"  Survivors — A(pure+exec)={aSurvivors}/60  B(py+noexec)={bSurvivors}/60  C(py+exec)={cSurvivors}/60");
+
+            // Acceptance: ZERO survivors across all three scenarios. Any
+            // remaining instance after two full cleanup cycles indicates a
+            // strong .NET reference somewhere in the static caches / event
+            // subscription graph. Reporting per-scenario localises the cause.
+            if (aSurvivors > 0)
+                throw new Exception($"WeakReference leak (A: pure .NET + execute): {aSurvivors}/60 instances survived — leak is in OpenTap core / TapX listeners (NOT Python)");
+            if (bSurvivors > 0)
+                throw new Exception($"WeakReference leak (B: Python step, no execute): {bSurvivors}/60 instances survived — leak is in Python step instantiation / type-data caching");
+            if (cSurvivors > 0)
+                throw new Exception($"WeakReference leak (C: Python + execute): {cSurvivors}/60 instances survived — leak is specific to executing Python plans");
+
+            Log.Info("  All TestPlan / ITestStep / TestPlanRun instances were collected — OK");
+        }
+
+        /// <summary>
+        /// Runs a sample of <paramref name="sampleSize"/> create-execute-drop
+        /// cycles and returns the total number of (plan + step + run)
+        /// instances that survived two full cleanup cycles.
+        /// </summary>
+        private int RunWeakRefScenario(ITypeData stepType, int sampleSize, bool execute)
+        {
+            var planRefs = new WeakReference[sampleSize];
+            var stepRefs = new WeakReference[sampleSize];
+            var runRefs = new WeakReference[sampleSize];
+
+            for (int i = 0; i < sampleSize; i++)
+                CreateAndExecuteOnce(stepType, i, planRefs, stepRefs, runRefs, execute);
+
+            RunFullCleanupCycle();
+            RunFullCleanupCycle();
+
+            int planAlive = 0, stepAlive = 0, runAlive = 0;
+            for (int i = 0; i < sampleSize; i++)
+            {
+                if (planRefs[i].IsAlive) planAlive++;
+                if (stepRefs[i].IsAlive) stepAlive++;
+                if (runRefs[i].IsAlive) runAlive++;
+            }
+
+            Log.Info($"     plan={planAlive}/{sampleSize}  step={stepAlive}/{sampleSize}  run={runAlive}/{sampleSize}");
+            return planAlive + stepAlive + runAlive;
+        }
+
+        /// <summary>
+        /// Helper for <see cref="TestWeakReferenceLeakDetector"/>: kept in a
+        /// separate method so the local strong references go out of scope
+        /// before the caller's GC, allowing the WeakReferences to be valid.
+        /// </summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static void CreateAndExecuteOnce(
+            ITypeData stepType,
+            int i,
+            WeakReference[] planRefs,
+            WeakReference[] stepRefs,
+            WeakReference[] runRefs,
+            bool execute)
+        {
+            var step = (ITestStep)stepType.CreateInstance();
+            var plan = new TestPlan();
+            plan.ChildTestSteps.Add(step);
+
+            TestPlanRun? run = null;
+            if (execute)
+                run = plan.Execute();
+
+            planRefs[i] = new WeakReference(plan);
+            stepRefs[i] = new WeakReference(step);
+            runRefs[i] = new WeakReference((object?)run ?? new object());
+
+            // Detach to mirror production teardown
+            plan.ChildTestSteps.Clear();
+            // local refs (step, plan, run) drop on method exit
+        }
+
+
+        private static string BuildPlanXml(ITypeData stepType, int stepCount = 1, string planName = "MemTestPlan")
+        {
+            // Use TapSerializer to round-trip a plan we build in-memory — ensures
+            // the XML is exactly what OpenTAP expects for this step type.
+            var plan = new TestPlan();
+            for (int i = 0; i < stepCount; i++)
+                plan.ChildTestSteps.Add((ITestStep)stepType.CreateInstance());
+            using var ms = new MemoryStream();
+            new TapSerializer().Serialize(ms, plan);
+            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
+        }
+
+        /// <summary>Deserialises a TestPlan XML using the same path as production (TestPlan.Load).</summary>
+        private static TestPlan LoadPlanFromXml(string xml)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(xml);
+            using var ms = new MemoryStream(bytes);
+            return TestPlan.Load(ms, "memtestplan.TapPlan");
+        }
+
+
         /// <list type="number">
         ///   <item>Finalizer drain</item>
         ///   <item>Python gc.collect × 3</item>
@@ -860,6 +1337,16 @@ namespace OpenTap.Python.UnitTests
                 // Evict phantom references on abandoned PythonDerived objects
                 try
                 {
+                    // Drop the strong PyObject anchors first so eviction can
+                    // actually free the Python wrapper (otherwise the anchor's
+                    // INCREF keeps tp_dealloc from firing).
+                    PythonTypeDataWrapper.RemoveAnchors(inst =>
+                    {
+                        if (inst is ITestStep step)
+                            return step.Parent == null;
+                        return false;
+                    });
+
                     Runtime.EvictAbandonedObjects(inst =>
                     {
                         if (inst is ITestStep step)

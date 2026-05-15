@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Reflection;
 using System.Threading;
 using Python.Runtime;
 
@@ -59,7 +61,96 @@ namespace OpenTap.Python
         private long _heapAtPlanStart;
         private int _cleanupCount;
         private int _peakThreadCount;
+        /// <summary>Last reflected count at which the type histogram was logged.</summary>
+        private int _lastHistogramReflected;
 
+        // ─── Live-plan tracking (shared across all instances) ──────────
+        // We need to know which TestPlan instances are currently executing
+        // so we can identify *abandoned* plans (and their entire step graph)
+        // for cycle-break eviction.  Without this set, the abandonment
+        // predicate `step.Parent == null` matches almost nothing — every
+        // step in an abandoned plan still references its parent container,
+        // and those containers reference up to the abandoned TestPlan.
+        // The only way to identify the whole island is to walk Parent → root
+        // and check whether the root TestPlan is in this live set.
+        private static readonly object _livePlansLock = new object();
+        private static readonly List<WeakReference> _liveTestPlans = new List<WeakReference>();
+        /// <summary>Reflection accessor for <c>TestPlanRun.plan</c> (private field).</summary>
+        private static readonly FieldInfo _testPlanRunPlanField =
+            typeof(TestPlanRun).GetField("plan", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        /// <summary>Adds <paramref name="plan"/> to the live-plan set.</summary>
+        private static void RegisterLivePlan(TestPlan plan)
+        {
+            if (plan == null) return;
+            lock (_livePlansLock)
+            {
+                _liveTestPlans.Add(new WeakReference(plan));
+            }
+        }
+
+        /// <summary>Removes <paramref name="plan"/> from the live-plan set
+        /// and prunes dead weak refs.</summary>
+        private static void UnregisterLivePlan(TestPlan plan)
+        {
+            lock (_livePlansLock)
+            {
+                for (int i = _liveTestPlans.Count - 1; i >= 0; i--)
+                {
+                    var t = _liveTestPlans[i].Target;
+                    if (t == null || ReferenceEquals(t, plan))
+                        _liveTestPlans.RemoveAt(i);
+                }
+            }
+        }
+
+        /// <summary>Returns true if <paramref name="plan"/> is in the live set.</summary>
+        private static bool IsPlanLive(TestPlan plan)
+        {
+            if (plan == null) return false;
+            lock (_livePlansLock)
+            {
+                foreach (var w in _liveTestPlans)
+                    if (ReferenceEquals(w.Target, plan)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Determines whether <paramref name="inst"/> belongs to a TestPlan
+        /// that is no longer live — i.e. it is an orphaned step / dynamic
+        /// member / etc. that should be evicted.
+        /// <para>
+        /// Logic: walk up the Parent chain until we find a <see cref="TestPlan"/>
+        /// (the natural root of any step graph) or run out.  If we end up at a
+        /// TestPlan that is NOT in the live set → abandoned.  If we end up at
+        /// any non-TestPlan root, it's a free-floating object (also abandoned).
+        /// </para>
+        /// </summary>
+        private static bool IsAbandoned(object inst)
+        {
+            // Direct TestPlan: abandoned iff not live.
+            if (inst is TestPlan plan) return !IsPlanLive(plan);
+
+            // Steps & dynamic test-plan-attached objects: walk Parent chain.
+            if (inst is ITestStepParent node)
+            {
+                // Bound the walk to defend against accidental cycles.
+                for (int i = 0; i < 64 && node != null; i++)
+                {
+                    if (node is TestPlan tp) return !IsPlanLive(tp);
+                    var next = node.Parent;
+                    if (ReferenceEquals(next, node)) break;
+                    node = next;
+                }
+                // Walked to a null root that wasn't a TestPlan → orphan.
+                return true;
+            }
+
+            // Not a step-graph object — leave alone (could be a global resource,
+            // ComponentSettings, etc.).
+            return false;
+        }
         /// <summary>
         /// Interval in seconds between periodic cleanup sweeps during test plan
         /// execution. Default 30 s keeps memory flat for ~10 s loop iterations.
@@ -76,6 +167,19 @@ namespace OpenTap.Python
             _heapAtPlanStart = GC.GetTotalMemory(forceFullCollection: false);
             _cleanupCount = 0;
             _peakThreadCount = 0;
+
+            // Register the actual TestPlan instance (private field on TestPlanRun)
+            // so cleanup cycles know which step graph is "live" and must NOT be
+            // evicted.  Anything else is fair game.
+            try
+            {
+                if (_testPlanRunPlanField != null)
+                {
+                    var plan = _testPlanRunPlanField.GetValue(planRun) as TestPlan;
+                    RegisterLivePlan(plan);
+                }
+            }
+            catch (Exception ex) { Log.Debug($"[ENTER] Live-plan register failed: {ex.Message}"); }
 
             if (!PythonEngine.IsInitialized) return;
 
@@ -120,6 +224,18 @@ namespace OpenTap.Python
                 _cleanupThread = null;
             }
 
+            // Unregister the live plan BEFORE the final cleanup so the just-
+            // finished plan's step graph is treated as abandoned and evicted.
+            try
+            {
+                if (_testPlanRunPlanField != null)
+                {
+                    var plan = _testPlanRunPlanField.GetValue(planRun) as TestPlan;
+                    UnregisterLivePlan(plan);
+                }
+            }
+            catch (Exception ex) { Log.Debug($"[EXIT] Live-plan unregister failed: {ex.Message}"); }
+
             if (!PythonEngine.IsInitialized) return;
 
             RunCleanupCycle("EXIT-FINAL");
@@ -147,20 +263,24 @@ namespace OpenTap.Python
         }
 
         /// <summary>
-        /// Four-phase cleanup targeting both managed and native memory.
+        /// Five-phase cleanup targeting both managed and native memory.
         /// <list type="number">
         ///   <item>Drain pythonnet Finalizer queue (deferred Py_DecRef from .NET finalizers)</item>
+        ///   <item>Break Python ↔ .NET cycle for orphaned Python-derived steps
+        ///   (RemoveAnchors + EvictAbandonedObjects)</item>
         ///   <item>Python gc.collect() × 3 generations + clear type cache</item>
         ///   <item>.NET GC.Collect (accelerates finalizer triggering)</item>
         ///   <item>Drain Finalizer queue again (picks up Phase 3 finalizers)</item>
         ///   <item>malloc_trim on Linux (return freed native memory to OS)</item>
         /// </list>
         /// <para>
-        /// <b>Note:</b> Previous versions included an EvictAbandonedObjects phase
-        /// to work around a phantom-reference leak in <c>InvokeCtor</c>. That root
-        /// cause has been fixed — <c>InvokeCtor</c> now properly releases the
-        /// <c>NewReference</c> after <c>__init__</c>, so <c>tp_dealloc</c> fires
-        /// naturally and the dealloc/resurrection lifecycle manages wrapper lifetimes.
+        /// The Python ↔ .NET cycle break in Phase 2 is required because
+        /// <see cref="PythonTypeDataWrapper"/> anchors a strong <see cref="PyObject"/>
+        /// in a <see cref="ConditionalWeakTable{TKey,TValue}"/> to keep the Python
+        /// wrapper's <c>__dict__</c> alive across <c>CreateInstance</c>.  That anchor
+        /// keeps an INCREF on the Python wrapper, which in turn holds a strong
+        /// GCHandle back to the .NET step, producing a self-sustaining cycle that
+        /// neither <see cref="GC"/> nor Python's <c>gc</c> can break on its own.
         /// </para>
         /// </summary>
         private void RunCleanupCycle(string tag)
@@ -181,6 +301,37 @@ namespace OpenTap.Python
                     // Python wrappers to reach rc=0 → tp_dealloc → reflectedObjects cleanup.
                     try { Finalizer.Instance.Collect(); }
                     catch (Exception ex) { Log.Debug($"[{tag}] Finalizer drain 1: {ex.Message}"); }
+
+                    // Phase 1b: Break the Python ↔ .NET reference cycle for orphaned
+                    // Python-derived test steps (steps whose parent has been cleared,
+                    // i.e. they have been removed from any test plan).
+                    //
+                    // Required because PythonTypeDataWrapper anchors a strong PyObject
+                    // in a CWT to keep the Python wrapper's __dict__ alive across
+                    // CreateInstance.  That anchor INCREFs the Python wrapper, and the
+                    // wrapper holds a strong GCHandle back to the .NET step — a cycle
+                    // that neither GC can break alone.  Dropping the anchor releases
+                    // the INCREF so EvictAbandonedObjects can finish the job.
+                    int anchorsReleased = 0;
+                    try
+                    {
+                        anchorsReleased = PythonTypeDataWrapper.RemoveAnchors(IsAbandoned);
+                    }
+                    catch (Exception ex) { Log.Debug($"[{tag}] RemoveAnchors: {ex.Message}"); }
+
+                    // Phase 1c: Evict the now-collectable Python wrappers that still
+                    // sit in reflectedObjects.  Without anchor INCREFs, the wrapper
+                    // refcount drops to zero, tp_dealloc runs, and the GCHandle on
+                    // the .NET step is released.
+                    int evicted = 0;
+                    try
+                    {
+                        evicted = Runtime.EvictAbandonedObjects(IsAbandoned);
+                    }
+                    catch (Exception ex) { Log.Debug($"[{tag}] EvictAbandonedObjects: {ex.Message}"); }
+
+                    if (anchorsReleased > 0 || evicted > 0)
+                        Log.Debug($"[{tag}] Cycle break: anchors released={anchorsReleased}, evicted={evicted}");
 
                     // Phase 2: Full Python GC sweep (all 3 generations) + clear type cache.
                     try
@@ -249,6 +400,30 @@ namespace OpenTap.Python
                          $"total: {totalDeltaMb:+0.0;-0.0;0.0} MB) " +
                          $"| Threads: process={processThreads}, " +
                          $"peak={_peakThreadCount}");
+
+                // Diagnostic: dump per-type histogram of reflected objects
+                // when growth is observed.  Helps identify which .NET type
+                // is accumulating across plan runs.
+                if (reflectedAfter > _lastHistogramReflected + 50 || reflectedAfter > 1000)
+                {
+                    _lastHistogramReflected = reflectedAfter;
+                    try
+                    {
+                        IReadOnlyList<(string TypeName, int Count, long TotalRc, int PythonDerivedCount, int ParentlessStepCount)> hist;
+                        using (Py.GIL())
+                        {
+                            hist = Runtime.DiagnoseTypeHistogram(topN: 15);
+                        }
+                        var sb = new System.Text.StringBuilder();
+                        sb.Append($"[{tag}] Top reflected types:");
+                        foreach (var row in hist)
+                        {
+                            sb.Append($"\n   {row.Count,5}× {row.TypeName} (rcSum={row.TotalRc}, pyDerived={row.PythonDerivedCount}, parentless={row.ParentlessStepCount})");
+                        }
+                        Log.Info(sb.ToString());
+                    }
+                    catch (Exception ex) { Log.Debug($"[{tag}] Histogram: {ex.Message}"); }
+                }
             }
             catch (Exception ex)
             {
